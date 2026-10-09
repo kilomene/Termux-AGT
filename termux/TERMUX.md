@@ -1,11 +1,20 @@
-# Termux-AGT — your Android phone as a Universal-AGT host
+# Termux-AGT — your Android phone as a deployment host
 
 Termux-AGT turns an Android phone running [Termux](https://termux.dev) into a
-first-class Universal-AGT host: the phone runs the Python host worker, claims
+first-class deployment host: the phone runs the Python host worker, claims
 deploy tasks from the control plane, and runs apps as supervised native
-processes. The control plane itself stays where it is (e.g.
-`https://uaht.novamail.store`) — the phone is just a host, like the Linux VM,
-except its apps are served from the phone's own IP address.
+processes. Termux-AGT is its own complete system — **not** part of
+uaht.novamail.store:
+
+| Piece | Termux-AGT | Universal-AGT |
+|---|---|---|
+| Control plane | `https://termux.novamail.store` | `https://uaht.novamail.store` |
+| Database | own Supabase project (`termux-agt`) | own Supabase project |
+| Edge / tunnel | own Cloudflare tunnel | own Cloudflare tunnel |
+| Hosts | Android phone(s) via Termux | Linux VM(s) via Docker |
+
+The phone is just a host — it dials out to `https://termux.novamail.store`,
+claims tasks, and serves its apps from the phone's own IP address.
 
 There is no Docker on Android, so the phone runs the **`termux` execution
 backend**: apps are supervised OS processes, not containers. Everything else
@@ -39,6 +48,34 @@ choice; the Wi-Fi/LAN IP works too).
 4. Android 7+ (arm64 recommended). The phone should stay on Wi-Fi and ideally
    on a charger — it is now a server.
 
+## Control plane install (on the VM, one time)
+
+Termux-AGT's control plane is its own production system — separate Supabase
+database, separate Cloudflare tunnel, separate domain. On the Debian/Ubuntu
+host (the Grok VM), as the `box` user:
+
+```bash
+git clone https://github.com/kilomene/Termux-AGT
+cd Termux-AGT
+bash install-termux-cp.sh
+```
+
+Before running it, two secret files must exist (the script fails loudly with
+the exact source if they're missing — it never prompts):
+
+- `/etc/termux-agt/tunnel.token` — Cloudflare dashboard → Zero Trust →
+  Tunnels → `termux-agt` (its own tunnel; DNS `termux.novamail.store`
+  CNAMEs to it, proxied)
+- `/etc/termux-agt/control-plane.env` — with `DATABASE_URL` (the
+  `termux-agt` Supabase project, **direct** connection port 5432),
+  `DATA_ENCRYPTION_KEY` and `UAHT_PROVISIONING_TOKEN` (fresh
+  `openssl rand -hex 32` values)
+
+The installer puts the API on internal port **3100** (uaht keeps 3000, so both
+systems can share the host), supervises it plus dual cloudflared plus a
+5-second watchdog, and installs a cron `@reboot` hook. Verify from anywhere:
+`curl https://termux.novamail.store/v1/health`.
+
 ## Install (on the phone, inside Termux)
 
 ```bash
@@ -52,9 +89,9 @@ The installer asks for three things:
 
 | Prompt | What it is |
 |---|---|
-| Control plane URL | `https://uaht.novamail.store` (default) |
+| Control plane URL | `https://termux.novamail.store` (default) |
 | Host name | e.g. `termux-phone` (default) |
-| Provisioning token | the control-plane provisioning token (same one the Linux installer uses) |
+| Provisioning token | the Termux-AGT control-plane provisioning token (from `/etc/termux-agt/control-plane.env` on the VM — never the uaht one) |
 
 It registers the phone as `host_type=termux-android-host` with
 `capabilities=["termux"]`, writes `~/agent-host/config/worker.env`
@@ -130,11 +167,9 @@ have the app read `os.environ["PORT"]` itself.
 ### Routing the deploy to the phone
 
 The control plane's scheduler maps `runtime=termux` → required capability
-`termux`, so auto-scheduling lands termux apps on termux hosts — **but that
-mapping lives in the control plane, which is built from the Universal-AGT
-repo**. Until that one-line change is deployed there, pin the deploy to the
-phone explicitly with its `host_id` (the deploy API accepts an explicit
-host). After the scheduler change is live, plain deploys route automatically.
+`termux`, so auto-scheduling lands termux apps on the phone automatically —
+no `host_id` pinning needed. (This mapping is part of Termux-AGT's own
+control plane, which is built from this repo.)
 
 ## Reaching your apps
 

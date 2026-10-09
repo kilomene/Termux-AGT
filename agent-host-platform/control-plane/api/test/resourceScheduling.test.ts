@@ -45,6 +45,7 @@ import { createApp } from '../src/index';
 import { generateAgentKey, generateHostToken } from '../src/lib/tokens';
 import {
   CONSUMING_DEPLOYMENT_STATUSES,
+  deploymentConstraintsForManifest,
   deploymentConstraintsForProject,
   isHostSchedulable,
   normalizeResources,
@@ -306,6 +307,22 @@ describe('Part 1B — normalizeResources (single parsing rule)', () => {
       requiredCapabilities: ['docker'],
       requiredCpuCores: null,
       requiredRamMb: null,
+    });
+  });
+
+  it('runtime=termux requires the termux capability (Termux-AGT phone hosts)', () => {
+    expect(deploymentConstraintsForProject({ runtime: 'termux', configuration: {} })).toEqual({
+      requiredCapabilities: ['termux'],
+      requiredCpuCores: null,
+      requiredRamMb: null,
+    });
+    // Manifest-level runtime wins the same way.
+    expect(
+      deploymentConstraintsForManifest({ runtime: 'termux', resources: { cpu: 0.5, memory: '256Mi' } }),
+    ).toEqual({
+      requiredCapabilities: ['termux'],
+      requiredCpuCores: 0.5,
+      requiredRamMb: 256,
     });
   });
 });

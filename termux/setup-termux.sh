@@ -92,8 +92,8 @@ if [ -s "$ENV_FILE" ] && grep -qE "^WORKER_HOST_TOKEN=[^[:space:]]" "$ENV_FILE";
   log "worker.env already has credentials; skipping registration"
 else
   log "registering this phone with the control plane"
-  read -r -p "Control plane URL [https://uaht.novamail.store]: " CP_URL
-  CP_URL="${CP_URL:-https://uaht.novamail.store}"
+  read -r -p "Control plane URL [https://termux.novamail.store]: " CP_URL
+  CP_URL="${CP_URL:-https://termux.novamail.store}"
   read -r -p "Host name [termux-phone]: " HOST_NAME
   HOST_NAME="${HOST_NAME:-termux-phone}"
   read -r -s -p "Provisioning token: " PROV_TOKEN; echo

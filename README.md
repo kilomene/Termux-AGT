@@ -3,20 +3,26 @@
 > **This repo is the Termux edition of
 > [Universal-AGT](https://github.com/kilomene/Universal-AGT).** It contains
 > the full Universal-AGT tree plus the Termux backend: your Android phone
-> (running [Termux](https://termux.dev)) becomes a first-class Universal-AGT
+> (running [Termux](https://termux.dev)) becomes a first-class deployment
 > host. The phone runs the Python host worker, claims deploy tasks from the
 > control plane, and runs apps as **supervised native processes** — there is
 > no Docker on Android. Deployed apps are served from the phone's own IP
 > address (`http://<phone-ip>:<port>/`).
 >
+> Termux-AGT is its **own system**, not part of uaht.novamail.store: own
+> control plane at `https://termux.novamail.store` (install with
+> `bash install-termux-cp.sh` on the VM), own Supabase database, own
+> Cloudflare tunnel. The phone is the host; the VM runs the control plane.
+>
 > **Start here: [`termux/TERMUX.md`](termux/TERMUX.md)** — the complete
-> phone setup guide (Termux install, `bash termux/setup-termux.sh`,
-> keep-alive, deploying, reaching your apps).
+> setup guide (control-plane install, Termux install,
+> `bash termux/setup-termux.sh`, keep-alive, deploying, reaching your apps).
 >
 > The `termux` manifest runtime, the process backend
-> (`agent-host-platform/host-worker/deployments/termux_runtime.py`), and the
-> Termux installer/supervisor/boot scripts are the Termux-AGT additions;
-> everything else is the Universal-AGT platform described below.
+> (`agent-host-platform/host-worker/deployments/termux_runtime.py`),
+> `install-termux-cp.sh`, and the Termux installer/supervisor/boot scripts
+> are the Termux-AGT additions; everything else is the Universal-AGT
+> platform described below.
 
 # Universal AGT — Universal Agent-to-Persistent-Host Deployment System
 
