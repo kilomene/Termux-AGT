@@ -94,6 +94,13 @@ class WorkerConfig:
     # before replacing/migrating the host. Heartbeats continue while
     # draining so the operator can watch running_apps drain to zero.
     draining: bool = False
+    # Termux backend (Android phone as host): when True the worker runs the
+    # Docker-free process backend (deployments/termux_runtime.py) and the
+    # deploy handler only accepts runtime=termux manifests. Set
+    # WORKER_TERMUX=true on the phone (the Termux installer does this).
+    # Auto-detected when $PREFIX looks like a Termux prefix, but the
+    # explicit env var always wins.
+    termux: bool = False
 
     @classmethod
     def load(cls, config_path: str | None = None, **overrides) -> "WorkerConfig":
@@ -130,6 +137,7 @@ class WorkerConfig:
             "ingress_enabled": ENV_PREFIX + "INGRESS_ENABLED",
             "ingress_provider": ENV_PREFIX + "INGRESS_PROVIDER",
             "draining": ENV_PREFIX + "DRAINING",
+            "termux": ENV_PREFIX + "TERMUX",
             # Runtime name is WORKER_TUNNEL_TOKEN (see the UAHT_TUNNEL_TOKEN ->
             # WORKER_TUNNEL_TOKEN installer mapping in docs/CONFIG.md). The
             # worker.env file key is WORKER_TUNNEL_TOKEN, normalized to
@@ -140,6 +148,25 @@ class WorkerConfig:
             if env_name in os.environ:
                 values[field_name] = os.environ[env_name]
         values.update({k: v for k, v in overrides.items() if v is not None})
+
+        # Termux detection: explicit WORKER_TERMUX wins; otherwise sniff the
+        # Termux $PREFIX (e.g. /data/data/com.termux/files/usr). On a phone
+        # the /opt + /srv defaults below do not exist, so Termux-aware
+        # defaults are applied unless the operator set the paths explicitly.
+        termux_mode = _as_bool(
+            values.get("termux",
+                       "true" if "com.termux" in os.environ.get("PREFIX", "")
+                       else False),
+            "termux",
+        )
+        if termux_mode and "work_dir" not in values:
+            values["work_dir"] = os.path.join(
+                os.environ.get("HOME", "/data/data/com.termux/files/home"),
+                "agent-host")
+        if termux_mode and "apps_dir" not in values:
+            values["apps_dir"] = os.path.join(
+                os.environ.get("HOME", "/data/data/com.termux/files/home"),
+                "agent-apps")
 
         cfg = cls(
             control_plane_url=str(values.get("control_plane_url", "")).rstrip("/"),
@@ -153,6 +180,7 @@ class WorkerConfig:
             work_dir=str(values.get("work_dir", "/opt/agent-host")),
             apps_dir=str(values.get("apps_dir", "/srv/agent-apps")),
             worker_version=str(values.get("worker_version", "0.1.0")),
+            termux=termux_mode,
             config_path=path,
             crash_loop_threshold=_as_int(
                 values.get("crash_loop_threshold", 5), "crash_loop_threshold"
@@ -229,5 +257,6 @@ class WorkerConfig:
             "ingress_enabled": self.ingress_enabled,
             "ingress_provider": self.ingress_provider,
             "draining": self.draining,
+            "termux": self.termux,
             "tunnel_token": "***" if self.tunnel_token else "",
         }

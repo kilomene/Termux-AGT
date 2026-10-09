@@ -78,8 +78,6 @@ def evaluate(ctx, threshold: int = DEFAULT_THRESHOLD,
     issues: list = []
     docker = ctx.docker
     store = ctx.deployment_store
-    if docker is None:
-        return issues
     now = time.time()
     try:
         states = store.list_all()
@@ -92,6 +90,15 @@ def evaluate(ctx, threshold: int = DEFAULT_THRESHOLD,
             issues.append(_issue(state, None, already=True))
             continue
         if state.get("status") != "running":
+            continue
+        if state.get("runtime") == "termux":
+            # Process backend: the supervisor records restart timestamps in
+            # restart_log — no Docker needed, so this runs even when the
+            # docker client is absent (always, on a phone).
+            _evaluate_termux(state, store, issues, threshold, window_s,
+                             now, log)
+            continue
+        if docker is None:
             continue
         name = state.get("container_name")
         if not name:
@@ -120,6 +127,43 @@ def evaluate(ctx, threshold: int = DEFAULT_THRESHOLD,
             store.save(state)
             issues.append(_issue(state, count, already=False))
     return issues
+
+
+def _evaluate_termux(state: dict, store, issues: list, threshold: int,
+                   window_s: int, now: float, log) -> None:
+    """Crash-loop pass for one termux-backend deployment.
+
+    Counts supervisor-recorded restarts inside the window; at the
+    threshold the process is stopped and flagged crash_loop (it will not
+    be restarted until an operator clears the flag or redeploys) — the
+    same semantics as the docker path's explicit stop.
+    """
+    from deployments import termux_runtime
+    deployment_id = state.get("deployment_id", "?")
+    try:
+        recent = [float(t) for t in (state.get("restart_log") or [])
+                  if now - float(t) <= window_s]
+    except (TypeError, ValueError):
+        recent = []
+    if len(recent) < threshold:
+        return
+    log("crash-loop: termux deployment %s restarted %d times in %ds; "
+        "stopping it (flagged, will not be restarted)",
+        deployment_id, len(recent), window_s)
+    try:
+        termux_runtime.stop_supervised(deployment_id)
+    except Exception as exc:
+        LOG.warning("crash-loop: stop_supervised(%s) failed: %s",
+                    deployment_id, exc)
+    state["crash_loop"] = True
+    state["status"] = "crash_loop"
+    state["pid"] = None
+    try:
+        store.save(state)
+    except Exception as exc:
+        LOG.warning("crash-loop: could not persist flag for %s: %s",
+                    deployment_id, exc)
+    issues.append(_issue(state, len(recent), already=False))
 
 
 def clear_crash_loop(ctx, deployment_id: str) -> bool:

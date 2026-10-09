@@ -4,9 +4,12 @@ Pure function: validate_manifest(data, project_name=None) -> (ok, errors).
 
 Rules enforced:
   * name: required, non-empty string; must equal project_name when given
-  * runtime: required, one of docker | docker-compose | static
+  * runtime: required, one of docker | docker-compose | static | termux
   * service.port: optional, integer 1..65535
   * service.healthcheck: optional, string starting with "/"
+  * service.command: REQUIRED for runtime=termux — the argv the worker runs
+    as a supervised Termux-native process (shlex-split, never a shell).
+    Ignored by the docker runtimes.
   * resources.memory: optional, like 256m | 512Mi | 1g (regex ^\\d{1,6}[mMgG][iI]?$)
   * resources.cpu: optional, positive number
   * restart: optional, one of no | always | unless-stopped | on-failure
@@ -17,7 +20,8 @@ Rules enforced:
     so a manifest-level `volumes` field would be persisted-but-inert and
     silently misleading. Persistent storage is available via
     runtime=docker-compose with named volumes or workspace-relative bind
-    mounts (validated by compose_validate.py).
+    mounts (validated by compose_validate.py). The termux runtime likewise
+    mounts nothing: the app runs with its extracted artifact dir as cwd.
 Unknown top-level keys are ignored (forward compatibility); unknown keys
 inside known sections are ignored as well.
 """
@@ -27,7 +31,10 @@ import math
 import re
 from typing import Any, Optional
 
-RUNTIMES = ("docker", "docker-compose", "static")
+RUNTIMES = ("docker", "docker-compose", "static", "termux")
+# Longest service.command the worker will accept (5k chars is generous for
+# an argv; anything longer is almost certainly a mistake or an exfil blob).
+MAX_COMMAND_CHARS = 5000
 RESTART_POLICIES = ("no", "always", "unless-stopped", "on-failure")
 # W16 audit: digit run capped at 6 — a 5000-digit "memory" passed the old
 # ^\d+$ shape and then blew up int() (Python 3.11+ caps str->int at 4300
@@ -106,6 +113,30 @@ def validate_manifest(data: Any,
                     "service.healthcheck: must be a string starting with '/', "
                     f"got {healthcheck!r}"
                 )
+            command = service.get("command")
+            if runtime == "termux":
+                # The termux backend has no image to build: the command IS
+                # the app. It is split with shlex (argv list, never a shell)
+                # and run with the extracted artifact dir as cwd.
+                if not isinstance(command, str) or not command.strip():
+                    errors.append(
+                        "service.command: required non-empty string for "
+                        "runtime=termux (e.g. \"python app.py\" or "
+                        "\"node server.js\")"
+                    )
+                elif len(command) > MAX_COMMAND_CHARS:
+                    errors.append(
+                        f"service.command: longer than {MAX_COMMAND_CHARS} "
+                        "characters; refusing"
+                    )
+            elif command is not None:
+                # Harmless on docker runtimes, but flag it so a manifest
+                # written for termux does not silently deploy elsewhere
+                # doing nothing.
+                if not isinstance(command, str):
+                    errors.append(
+                        f"service.command: must be a string, got {command!r}"
+                    )
 
     # -- resources -------------------------------------------------------
     resources = data.get("resources", {})

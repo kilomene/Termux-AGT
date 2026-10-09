@@ -303,7 +303,10 @@ export function deploymentConstraintsForManifest(
   const runtime =
     typeof cfg.runtime === 'string' ? cfg.runtime : typeof fallbackRuntime === 'string' ? fallbackRuntime : 'docker';
   const runtimeCaps =
-    runtime === 'docker-compose' ? ['docker-compose'] : runtime === 'docker' ? ['docker'] : [];
+    runtime === 'docker-compose' ? ['docker-compose']
+    : runtime === 'docker' ? ['docker']
+    : runtime === 'termux' ? ['termux']  // Termux-AGT: Android phone hosts
+    : [];
   const extraCaps = Array.isArray(cfg.capabilities)
     ? (cfg.capabilities as unknown[]).filter((c): c is string => typeof c === 'string')
     : [];

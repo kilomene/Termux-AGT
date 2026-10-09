@@ -140,9 +140,271 @@ def _ingress_after_change(ctx, task_id: str, deployment_id) -> None:
 # ---------------------------------------------------------------------------
 # lifecycle: restart | stop | start | remove | rollback
 # ---------------------------------------------------------------------------
+
+def _is_termux(state: dict) -> bool:
+    """True for deployments run by the termux process backend (no Docker)."""
+    return state.get("runtime") == "termux"
+
+
+def _termux_restart(ctx, task: dict, state: dict) -> dict:
+    """Restart a termux deployment's process under a fresh supervisor."""
+    from deployments import termux_runtime
+    deployment_id = state["deployment_id"]
+    ctx.log(_task_id(task), f"restarting termux process for {deployment_id}")
+    termux_runtime.stop_supervised(deployment_id)
+    termux_runtime.ensure_supervised(
+        ctx.deployment_store, state,
+        log=lambda line: ctx.log(_task_id(task), line))
+    state = ctx.deployment_store.load(deployment_id) or state
+    state["status"] = "running"
+    state.pop("crash_loop", None)  # manual restart clears the flag
+    ctx.deployment_store.save(state)
+    return {"deployment_id": deployment_id, "status": "restarted",
+            "pid": state.get("pid")}
+
+
+def _termux_stop(ctx, task: dict, state: dict) -> dict:
+    from deployments import termux_runtime
+    deployment_id = state["deployment_id"]
+    ctx.log(_task_id(task), f"stopping termux process for {deployment_id}")
+    termux_runtime.stop_supervised(deployment_id)
+    state["status"] = "stopped"
+    state["pid"] = None
+    ctx.deployment_store.save(state)
+    return {"deployment_id": deployment_id, "status": "stopped"}
+
+
+def _termux_start(ctx, task: dict, state: dict) -> dict:
+    from deployments import termux_runtime
+    deployment_id = state["deployment_id"]
+    sup = termux_runtime.get_supervisor(deployment_id)
+    if sup is not None and sup.alive():
+        return {"deployment_id": deployment_id, "status": "running",
+                "pid": sup.pid, "note": "already running"}
+    ctx.log(_task_id(task), f"starting termux process for {deployment_id}")
+    termux_runtime.ensure_supervised(
+        ctx.deployment_store, state,
+        log=lambda line: ctx.log(_task_id(task), line))
+    state = ctx.deployment_store.load(deployment_id) or state
+    state["status"] = "running"
+    ctx.deployment_store.save(state)
+    return {"deployment_id": deployment_id, "status": "running",
+            "pid": state.get("pid")}
+
+
+def _termux_remove(ctx, task: dict, state: dict) -> dict:
+    from deployments import termux_runtime
+    deployment_id = state["deployment_id"]
+    ctx.log(_task_id(task), f"removing termux deployment {deployment_id}")
+    termux_runtime.stop_supervised(deployment_id)
+    state["status"] = "removed"
+    state["pid"] = None
+    ctx.deployment_store.save(state)
+    _ingress_after_change(ctx, _task_id(task), deployment_id)
+    return {"deployment_id": deployment_id, "status": "removed"}
+
+
+def _termux_rollback(ctx, task: dict, state: dict) -> dict:
+    """Roll a termux deployment back to a previous generation's process.
+
+    Verify BEFORE teardown (a bad target fails loudly leaving the current
+    deployment untouched), then stop the current process, promote the
+    target under supervision, and healthcheck it for real.
+    """
+    from deployments import termux_runtime
+    from health import checker as health_checker
+    payload = _payload(task)
+    task_id = _task_id(task)
+    log = lambda line: ctx.log(task_id, line)  # noqa: E731
+    current = state
+    project_id = current.get("project_id")
+
+    def _termux_restorable(s: dict) -> bool:
+        return bool(s.get("command")) and s.get("runtime") == "termux"
+
+    target = None
+    target_id = payload.get("target_deployment_id")
+    if target_id:
+        candidate = ctx.deployment_store.load(target_id)
+        if candidate is None:
+            raise HandlerError(
+                f"rollback target deployment {target_id} not found in the "
+                f"local registry")
+        if candidate.get("project_id") != project_id:
+            raise HandlerError(
+                f"rollback target {target_id} belongs to a different project")
+        if not _termux_restorable(candidate):
+            raise HandlerError(
+                f"rollback target {target_id} has no recorded command")
+        target = candidate
+    else:
+        candidates = [
+            s for s in ctx.deployment_store.list_all()
+            if s.get("project_id") == project_id
+            and s.get("deployment_id") != current["deployment_id"]
+            and _termux_restorable(s)
+            and s.get("status") in ("running", "superseded", "stopped")
+        ]
+        if not candidates:
+            raise HandlerError(
+                f"no rollback candidate for project {current.get('project_name')}")
+        target = candidates[0]  # list_all is newest-first
+    log(f"rolling back {current['deployment_id']} -> {target['deployment_id']}")
+
+    current["rollback_status"] = "requested"
+    current["rollback_target_deployment_id"] = target["deployment_id"]
+    current.pop("rollback_error", None)
+    ctx.deployment_store.save(current)
+
+    health_timeout = int(payload.get("healthcheck_timeout", 60))
+    target_port = target.get("host_port")
+    target_path = target.get("healthcheck_path") or "/"
+
+    def _target_healthy() -> bool:
+        if not target_port:
+            return False
+        return health_checker.wait_for_healthcheck(
+            int(target_port), target_path, timeout_secs=health_timeout,
+            log=log)
+
+    # Verify BEFORE teardown: if the target is stopped, start it first.
+    if target.get("status") != "running" or not _target_healthy():
+        if target.get("status") != "running":
+            log(f"starting rollback target {target['deployment_id']}")
+            termux_runtime.ensure_supervised(ctx.deployment_store, target,
+                                             log=log)
+            target = ctx.deployment_store.load(target["deployment_id"]) or target
+            target_port = target.get("host_port")
+        if not _target_healthy():
+            current["rollback_status"] = "failed"
+            current["rollback_error"] = (
+                f"rollback target {target['deployment_id']} is not healthy; "
+                f"current deployment left untouched")[:500]
+            ctx.deployment_store.save(current)
+            raise HandlerError(current["rollback_error"])
+    # Target verified: tear down the current deployment, promote target.
+    log(f"target healthy; stopping current {current['deployment_id']}")
+    termux_runtime.stop_supervised(current["deployment_id"])
+    current["status"] = "rolled_back"
+    current["pid"] = None
+    target["status"] = "running"
+    ctx.deployment_store.save(target)
+    try:
+        settle = rollback_mod.settle_rollback_ports(
+            ctx, log, current["deployment_id"], target["deployment_id"])
+    except Exception as exc:
+        settle = {"settled": False, "reason": f"settle error: {exc}"}
+    settle_failed = (not settle["settled"]
+                     and settle.get("reason") != "no control-plane session")
+    if settle_failed:
+        current["status"] = "rollback_failed"
+        current["rollback_status"] = "partially_reconciled"
+        current["rollback_error"] = (
+            f"target restored and healthy but port-registry settle failed: "
+            f"{settle.get('reason')}")[:500]
+    else:
+        current["rollback_status"] = "succeeded"
+    current["port_settle"] = {"settled": settle["settled"],
+                              "reason": settle.get("reason")}
+    ctx.deployment_store.save(current)
+    _ingress_after_change(ctx, task_id, target["deployment_id"])
+    return {"deployment_id": current["deployment_id"],
+            "status": current["status"],
+            "rollback_status": current["rollback_status"],
+            "rolled_back_to": target["deployment_id"],
+            "ports_settled": settle["settled"]}
+
+
+def _termux_environment_update(ctx, task: dict, state: dict) -> dict:
+    """Update a termux deployment's env and restart its process with it.
+
+    The merged env (stored non-secret env + payload env + payload secrets)
+    becomes the new process env; only non-secret values are persisted to
+    state.json — secrets live in the process env alone, exactly like the
+    deploy path.
+    """
+    from deployments import termux_runtime
+    payload = _payload(task)
+    deployment_id = state["deployment_id"]
+    new_env = deploy_pipeline.sanitize_env(payload.get("env"))
+    if not isinstance(new_env, dict) or not new_env:
+        raise HandlerError("payload env must be a non-empty object")
+    secret_env = deploy_pipeline.sanitize_env(payload.get("secrets"))
+    merged = {**state.get("env", {}), **new_env, **secret_env}
+    ctx.log(_task_id(task),
+            f"restarting termux process for {deployment_id} with "
+            f"{len(merged)} env vars")
+    termux_runtime.stop_supervised(deployment_id)
+    state["env"] = {k: v for k, v in merged.items() if k not in secret_env}
+    ctx.deployment_store.save(state)
+    # ensure_supervised rebuilds env from the stored state; secrets must
+    # ride along for this start, so overlay them on the stored state copy.
+    live_state = dict(state)
+    live_state["env"] = merged
+    termux_runtime.ensure_supervised(
+        ctx.deployment_store, live_state,
+        log=lambda line: ctx.log(_task_id(task), line))
+    state = ctx.deployment_store.load(deployment_id) or state
+    state["status"] = "running"
+    ctx.deployment_store.save(state)
+    return {"deployment_id": deployment_id, "status": "running",
+            "updated_env_keys": sorted(new_env)}
+
+
+def _termux_logs(ctx, task: dict, state: dict) -> dict:
+    payload = _payload(task)
+    tail = int(payload.get("tail", 500))
+    tail = max(1, min(tail, 5000))
+    log_path = state.get("log_path")
+    lines: list[str] = []
+    if log_path:
+        try:
+            with open(log_path, "r", encoding="utf-8",
+                       errors="replace") as fh:
+                # Cheap tail: read the last ~tail*220 bytes, split lines.
+                fh.seek(0, 2)
+                size = fh.tell()
+                fh.seek(max(0, size - tail * 220))
+                lines = fh.read().splitlines()[-tail:]
+        except OSError as exc:
+            lines = [f"<could not read app log: {exc}>"]
+    else:
+        lines = ["<no app log recorded for this deployment>"]
+    return {"deployment_id": state["deployment_id"],
+            "logs": "\n".join(lines)}
+
+
+def _termux_status(ctx, task: dict, state: dict) -> dict:
+    from deployments import termux_runtime
+    deployment_id = state["deployment_id"]
+    pid = state.get("pid")
+    alive = (termux_runtime.get_supervisor(deployment_id) is not None
+             and termux_runtime.supervised_pid(deployment_id) is not None
+             and termux_runtime.is_alive(
+                 int(termux_runtime.supervised_pid(deployment_id))))
+    if not alive and pid:
+        alive = termux_runtime.is_alive(int(pid))
+    return {"deployment_id": deployment_id,
+            "runtime": "termux",
+            "status": state.get("status"),
+            "process_alive": alive,
+            "pid": (termux_runtime.supervised_pid(deployment_id)
+                    if alive else None),
+            "ports": {str(state["host_port"]): state["host_port"]}
+            if state.get("host_port") else {},
+            "command": state.get("command_str"),
+            "crash_loop": bool(state.get("crash_loop"))}
+
+
+# ---------------------------------------------------------------------------
+# lifecycle: restart | stop | start | remove | rollback
+# ---------------------------------------------------------------------------
 def handle_restart(ctx, task: dict) -> dict:
     payload = _payload(task)
     _require(payload, "deployment_id")
+    _st = _deployment_state(ctx, payload["deployment_id"])
+    if _is_termux(_st):
+        return _termux_restart(ctx, task, _st)
     docker = ctx.require_docker()
     state, project = _compose_deployment(ctx, payload["deployment_id"])
     if project:
@@ -165,6 +427,9 @@ def handle_restart(ctx, task: dict) -> dict:
 def handle_stop(ctx, task: dict) -> dict:
     payload = _payload(task)
     _require(payload, "deployment_id")
+    _st = _deployment_state(ctx, payload["deployment_id"])
+    if _is_termux(_st):
+        return _termux_stop(ctx, task, _st)
     docker = ctx.require_docker()
     state, project = _compose_deployment(ctx, payload["deployment_id"])
     if project:
@@ -191,6 +456,9 @@ def handle_stop(ctx, task: dict) -> dict:
 def handle_start(ctx, task: dict) -> dict:
     payload = _payload(task)
     _require(payload, "deployment_id")
+    _st = _deployment_state(ctx, payload["deployment_id"])
+    if _is_termux(_st):
+        return _termux_start(ctx, task, _st)
     docker = ctx.require_docker()
     state, project = _compose_deployment(ctx, payload["deployment_id"])
     if project:
@@ -217,8 +485,10 @@ def handle_start(ctx, task: dict) -> dict:
 def handle_remove(ctx, task: dict) -> dict:
     payload = _payload(task)
     _require(payload, "deployment_id")
-    docker = ctx.require_docker()
     state = _deployment_state(ctx, payload["deployment_id"])
+    if _is_termux(state):
+        return _termux_remove(ctx, task, state)
+    docker = ctx.require_docker()
     name = state.get("container_name")
     if name:
         ctx.log(_task_id(task), f"removing container {name}")
@@ -255,8 +525,10 @@ def handle_rollback(ctx, task: dict) -> dict:
     """
     payload = _payload(task)
     _require(payload, "deployment_id")
-    docker = ctx.require_docker()
     current = _deployment_state(ctx, payload["deployment_id"])
+    if _is_termux(current):
+        return _termux_rollback(ctx, task, current)
+    docker = ctx.require_docker()
     project_id = current.get("project_id")
 
     target = None
@@ -441,6 +713,9 @@ def _compose_status(docker, project: str) -> dict:
 def handle_logs(ctx, task: dict) -> dict:
     payload = _payload(task)
     _require(payload, "deployment_id")
+    _st = _deployment_state(ctx, payload["deployment_id"])
+    if _is_termux(_st):
+        return _termux_logs(ctx, task, _st)
     docker = ctx.require_docker()
     tail = int(payload.get("tail", 500))
     tail = max(1, min(tail, 5000))
@@ -457,6 +732,9 @@ def handle_logs(ctx, task: dict) -> dict:
 def handle_status(ctx, task: dict) -> dict:
     payload = _payload(task)
     _require(payload, "deployment_id")
+    _st = _deployment_state(ctx, payload["deployment_id"])
+    if _is_termux(_st):
+        return _termux_status(ctx, task, _st)
     docker = ctx.require_docker()
     state, project = _compose_deployment(ctx, payload["deployment_id"])
     if project:
@@ -655,8 +933,10 @@ def handle_environment_update(ctx, task: dict) -> dict:
     """
     payload = _payload(task)
     _require(payload, "deployment_id")
-    docker = ctx.require_docker()
     state = _deployment_state(ctx, payload["deployment_id"])
+    if _is_termux(state):
+        return _termux_environment_update(ctx, task, state)
+    docker = ctx.require_docker()
     name = state.get("container_name")
     if not name:
         raise HandlerError("deployment has no container to update")

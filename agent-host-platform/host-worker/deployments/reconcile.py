@@ -66,9 +66,15 @@ def reconcile(ctx, log=None) -> dict:
 
     store = ctx.deployment_store
     docker = ctx.docker
+    # Termux-backend deployments reconcile against live processes, not
+    # Docker — this runs on every boot regardless of Docker presence (on a
+    # phone there is never a Docker daemon).
+    _reconcile_termux(ctx, summary, note)
     if docker is None:
-        note("docker unavailable; reconciliation skipped")
-        summary["skipped"] = len(_desired_running(store))
+        note("docker unavailable; docker reconciliation skipped")
+        summary["skipped"] = len(
+            [s for s in _desired_running(store)
+             if s.get("runtime") != "termux"])
         return summary
 
     # Spec §6 first: a crash mid-rollback leaves transient rollback
@@ -112,6 +118,57 @@ def reconcile(ctx, log=None) -> dict:
             _recreate_container(ctx, state, summary, note)
     _report_unexpected(ps_all, store, summary, note)
     return summary
+
+
+def _reconcile_termux(ctx, summary: dict, note) -> None:
+    """Boot reconciliation for termux-backend (process) deployments.
+
+    Desired-running termux deployments whose supervisor is gone get one
+    back: a still-live recorded pid is adopted (the orphan is stopped and
+    the app restarted under a fresh supervisor, so exactly one supervised
+    instance exists); a dead pid is simply restarted.
+
+    Secrets are never persisted to state.json, so a deployment that ran
+    with secrets cannot be faithfully restored after the phone reboots.
+    Those are marked ``degraded`` (not restarted) and surfaced in the
+    summary — the operator redeploys to restore them.
+    """
+    from deployments import termux_runtime
+    store = ctx.deployment_store
+    for state in _desired_running(store):
+        if state.get("runtime") != "termux":
+            continue
+        deployment_id = state.get("deployment_id", "?")
+        project = state.get("project_name", "?")
+        sup = termux_runtime.get_supervisor(deployment_id)
+        if sup is not None and sup.alive():
+            summary["already_running"] += 1
+            note(f"{project} ({deployment_id}): termux process already "
+                 f"supervised")
+            continue
+        if state.get("had_secrets"):
+            state["status"] = "degraded"
+            state["pid"] = None
+            try:
+                store.save(state)
+            except Exception:
+                pass
+            summary["missing"] += 1
+            note(f"{project} ({deployment_id}): NOT restarted after reboot — "
+                 f"it ran with secrets, which are never persisted; redeploy "
+                 f"to restore it")
+            continue
+        try:
+            termux_runtime.ensure_supervised(
+                store, state,
+                log=lambda line, _p=project: note(f"{_p}: {line}"))
+            summary["reconciled"] += 1
+            note(f"{project} ({deployment_id}): termux process restarted "
+                 f"under supervision")
+        except Exception as exc:
+            summary["missing"] += 1
+            note(f"{project} ({deployment_id}): could not restart termux "
+                 f"process: {exc}")
 
 
 def _desired_running(store) -> list:

@@ -921,6 +921,34 @@ def deploy(ctx, task: dict) -> dict:
         reserve_resources(deployment_id, need_cpu, need_mb, store, log=log)
         resource_reserved = True
 
+    # Termux backend (Android phone hosts): the Docker-free process path.
+    # A termux-configured worker only runs runtime=termux manifests —
+    # container images cannot exist where there is no Docker — and a
+    # non-termux host never runs runtime=termux (no container boundary:
+    # the process backend must not execute agent code on shared hosts).
+    # The branch runs BEFORE require_docker() so a termux host never
+    # touches Docker.
+    if runtime == "termux" and not getattr(ctx.config, "termux", False):
+        raise DeployError(
+            "runtime=termux requires a termux-backend host "
+            "(WORKER_TERMUX=true); this host refuses to run it")
+    if runtime == "termux":
+        return _deploy_termux(
+            ctx, task, payload, manifest_data, log,
+            project_id=project_id, project_name=project_name,
+            version=version, artifact_id=artifact_id,
+            deployment_id=deployment_id, task_id=task_id,
+            extract_dir=extract_dir, store=store, work_dir=work_dir,
+            state_dir=state_dir, resource_reserved=resource_reserved,
+            restart_policy=restart_policy, manifest_env=manifest_env,
+            run_env=run_env, secret_env=secret_env, resources=resources,
+            healthcheck_path=healthcheck_path)
+    if getattr(ctx.config, "termux", False):
+        raise DeployError(
+            "this host runs the termux backend (no Docker): refusing "
+            f"runtime={runtime!r}; deploy with runtime=termux and a "
+            "service.command instead")
+
     # §4-§5 run under this try/except: they execute after the §3 resource
     # reservation (and the §5 compose port reservation) is taken but before
     # the section-6 try/finally is entered. An exception here — docker
@@ -1394,6 +1422,302 @@ def deploy(ctx, task: dict) -> dict:
             # On success the persisted state row (carrying the resources)
             # now accounts for this deployment; on failure nothing was
             # persisted. Either way the in-flight reservation is done.
+            release_resource_reservation(deployment_id)
+
+
+def _verify_port_free_os(host_port: int, log=None) -> None:
+    """Fail if something on this host already answers on host_port.
+
+    The docker path checks both OS-level and Docker-level; the termux
+    backend has no Docker, so the OS bind test is the whole check.
+    """
+    import socket as _socket
+    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", int(host_port)))
+    except OSError as exc:
+        raise DeployError(
+            f"host port {host_port} is not free on this host: {exc}; "
+            f"refusing to deploy over it") from exc
+    finally:
+        sock.close()
+    if log:
+        log(f"port {host_port} verified free on this host")
+
+
+def _stop_termux_generation(ctx, state: dict, log) -> None:
+    """Stop a termux deployment's supervisor + process. Never raises."""
+    from deployments import termux_runtime
+    deployment_id = state.get("deployment_id", "?")
+    try:
+        termux_runtime.stop_supervised(deployment_id)
+    except Exception as exc:
+        log(f"warning: stopping termux deployment {deployment_id}: {exc}")
+
+
+def _gc_termux_generations(ctx, project_id: str, keep: int = 2, log=None) -> None:
+    """Remove old termux generations' state dirs beyond ``keep`` newest.
+
+    The docker GC (gc.collect_garbage) skips dockerless hosts entirely, so
+    the termux backend does its own cleanup: generations of this project
+    with runtime=termux in a terminal-ish state (superseded/stopped/failed)
+    older than the newest ``keep`` are stopped (if somehow still
+    supervised) and their state dirs removed. Never raises; never touches
+    non-termux states.
+    """
+    from deployments import termux_runtime
+    import shutil as _shutil
+    log = log or (lambda line: None)
+    store = ctx.deployment_store
+    try:
+        generations = [
+            s for s in store.list_all()
+            if s.get("project_id") == project_id
+            and s.get("runtime") == "termux"
+            and s.get("status") in ("superseded", "stopped", "failed",
+                                    "removed", "rollback_failed")
+        ]
+    except Exception as exc:
+        log(f"termux gc: could not read store: {exc}")
+        return
+    # list_all is newest-first (seq ordering); drop everything past keep.
+    for old in generations[keep:]:
+        did = old.get("deployment_id", "?")
+        try:
+            termux_runtime.stop_supervised(did)
+        except Exception:
+            pass
+        state_dir = Path(store.root) / str(old.get("deployment_id", ""))
+        try:
+            if state_dir.is_dir():
+                _shutil.rmtree(state_dir, ignore_errors=True)
+                log(f"termux gc: removed old generation {did}")
+        except Exception as exc:
+            log(f"termux gc: could not remove {did}: {exc}")
+
+
+def _deploy_termux(ctx, task: dict, payload: dict, manifest_data: dict, log,
+                   project_id: str, project_name: str, version: str,
+                   artifact_id: str | None, deployment_id: str, task_id: str,
+                   extract_dir: str | None, store, work_dir: Path,
+                   state_dir: Path, resource_reserved: bool,
+                   restart_policy: str, manifest_env: dict, run_env: dict,
+                   secret_env: dict, resources: dict,
+                   healthcheck_path: str) -> dict:
+    """Deploy a runtime=termux app as a supervised Termux-native process.
+
+    Mirrors the docker path's contract: artifact verified before anything
+    runs (done by the caller), previous healthy generation kept as the
+    rollback target, port reserved before start, HTTP-200 healthcheck gate
+    (deploy rule #1, 120s default), state persisted on success, reservations
+    released on every path. No Docker interaction anywhere in this
+    function — it must also work when ctx.docker is None (it always is on
+    a termux host).
+    """
+    from deployments import termux_runtime
+
+    service = manifest_data.get("service") or {}
+    try:
+        argv = termux_runtime.split_command(service.get("command") or "")
+    except termux_runtime.TermuxError as exc:
+        raise DeployError(str(exc)) from exc
+    if not extract_dir or not os.path.isdir(extract_dir):
+        raise DeployError(
+            "runtime=termux needs artifact_id carrying the app files")
+
+    reserved_ports: list[int] = []
+    new_pid: int | None = None
+    try:
+        # -- previous healthy generation (rollback target) ------------------
+        previous = store.latest_for_project(project_id, statuses=("running",))
+        if previous and previous.get("runtime") != "termux":
+            log("previous deployment is not a termux deployment; "
+                "no rollback target on this backend")
+            previous = None
+        elif previous:
+            log(f"rollback target: previous deployment "
+                f"{previous['deployment_id']} (pid {previous.get('pid')})")
+        else:
+            log("no previous healthy deployment; rollback target: none")
+
+        # -- port ---------------------------------------------------------
+        requested = payload.get("requested_host_port")
+        if requested is not None:
+            try:
+                requested_port = int(requested)
+            except (TypeError, ValueError):
+                raise DeployError(
+                    f"invalid requested_host_port {requested!r}; expected an "
+                    f"integer 1-65535") from None
+            if not 1 <= requested_port <= 65535:
+                raise DeployError(
+                    f"invalid requested_host_port {requested!r}; expected an "
+                    f"integer 1-65535")
+            host_port = requested_port
+            log(f"using registry-reserved host port {host_port}")
+            reserved_ports = reserve_declared_ports([host_port], deployment_id)
+        else:
+            host_port = reserve_free_port(store, log=log,
+                                          deployment_id=deployment_id)
+            reserved_ports = [host_port]
+        _verify_port_free_os(host_port, log=log)
+
+        # -- start --------------------------------------------------------
+        # The app learns its port from $PORT (12-factor style); manifest
+        # env + secrets ride along. Secrets become process env only —
+        # never persisted to state.json (see the state dict below).
+        app_env = dict(run_env)
+        app_env["PORT"] = str(host_port)
+        log_path = str(state_dir / "app.log")
+        log(f"termux run: argv={argv} cwd={extract_dir} port={host_port}")
+        try:
+            proc = termux_runtime.start_process(argv, extract_dir, app_env,
+                                                log_path)
+        except Exception as exc:
+            raise DeployError(f"could not start app process: {exc}") from exc
+        new_pid = proc.pid
+        log(f"app process started pid={new_pid}")
+
+        # -- healthcheck (deploy rule #1) ---------------------------------
+        health_timeout = int(payload.get("healthcheck_timeout", 120))
+        log(f"healthcheck: GET :{host_port}{healthcheck_path} "
+            f"(timeout {health_timeout}s)")
+        healthy = termux_runtime.wait_healthy(
+            host_port, healthcheck_path, timeout_secs=health_timeout, log=log)
+
+        if healthy:
+            # New generation healthy: retire the previous one (it is
+            # stopped, not removed — kept for rollback, like the docker
+            # path) and persist the new generation under supervision.
+            if previous:
+                log(f"new version healthy; stopping previous deployment "
+                    f"{previous['deployment_id']} (kept for rollback)")
+                _stop_termux_generation(ctx, previous, log)
+                prev_state = store.load(previous["deployment_id"]) or previous
+                prev_state["status"] = "superseded"
+                prev_state["pid"] = None
+                store.save(prev_state)
+            state = {
+                "deployment_id": deployment_id,
+                "task_id": task_id,
+                "project_id": project_id,
+                "project_name": project_name,
+                "version": version,
+                "artifact_id": artifact_id,
+                "runtime": "termux",
+                "host_port": host_port,
+                "container_port": host_port,
+                "ports": {str(host_port): host_port},
+                "command": argv,
+                "command_str": service.get("command"),
+                "pid": new_pid,
+                "app_dir": extract_dir,
+                "log_path": log_path,
+                "restart": restart_policy,
+                "restart_log": [],
+                "resources": {
+                    "cpu": resources.get("cpu"),
+                    "memory": resources.get("memory"),
+                },
+                "healthcheck_path": healthcheck_path,
+                "env": manifest_env,  # secrets deliberately NOT persisted
+                "had_secrets": bool(secret_env),
+                "status": "running",
+                "health_status": "healthy",
+                "previous_deployment_id": (previous or {}).get("deployment_id"),
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+            persist_state_releasing_reservation(store, state, deployment_id)
+            # Adopt the just-started process under a supervisor so crashes
+            # restart per the manifest policy from here on.
+            termux_runtime.adopt_process(
+                store, deployment_id, proc, argv, extract_dir, app_env,
+                log_path, restart_policy)
+            log(f"deploy OK: {project_name} {version} healthy on "
+                f":{host_port} (pid {new_pid}, supervised)")
+            try:
+                _gc_termux_generations(ctx, project_id, log=log)
+            except Exception as exc:  # GC must never fail a good deploy
+                log(f"termux gc error (non-fatal): {exc}")
+            return {
+                "deployment_id": deployment_id,
+                "status": "running",
+                "health_status": "healthy",
+                "pid": new_pid,
+                "ports": {str(host_port): host_port},
+            }
+
+        # -- failure: kill the new process; previous still serving ---------
+        log("healthcheck failed; stopping the new process")
+        termux_runtime.stop_process(new_pid)
+        new_pid = None
+        app_log_tail = ""
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(0, size - 4000))
+                app_log_tail = fh.read()[-4000:]
+        except OSError:
+            pass
+        if app_log_tail:
+            log(f"failed app logs (tail):\n{app_log_tail}")
+        # The previous generation was never stopped — it is still running
+        # under its supervisor. Verify it still answers before calling
+        # this a clean failure.
+        prev_ok = False
+        if previous:
+            prev_ok = termux_runtime.wait_healthy(
+                int(previous["host_port"]),
+                previous.get("healthcheck_path") or "/",
+                timeout_secs=30, log=log)
+            log(f"previous generation {previous['deployment_id']} "
+                f"{'still healthy' if prev_ok else 'UNHEALTHY after failed deploy'}")
+        store.save({
+            "deployment_id": deployment_id,
+            "task_id": task_id,
+            "project_id": project_id,
+            "project_name": project_name,
+            "version": version,
+            "artifact_id": artifact_id,
+            "runtime": "termux",
+            "host_port": None,
+            "container_port": None,
+            "ports": None,
+            "command": argv,
+            "command_str": service.get("command"),
+            "pid": None,
+            "app_dir": extract_dir,
+            "log_path": log_path,
+            "restart": restart_policy,
+            "healthcheck_path": healthcheck_path,
+            "env": manifest_env,
+            "had_secrets": bool(secret_env),
+            "status": "failed",
+            "health_status": "unhealthy",
+            "previous_deployment_id": (previous or {}).get("deployment_id"),
+            "previous_still_healthy": prev_ok,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        })
+        err = (f"healthcheck failed for {project_name} {version} "
+               f"(GET :{host_port}{healthcheck_path} never returned 200); "
+               + (f"previous generation {previous['deployment_id']} still "
+                  f"serving (healthy={prev_ok})" if previous
+                  else "no previous healthy deployment to roll back to"))
+        raise DeployError(err)
+    finally:
+        # A failure AFTER adopt_process must not kill the supervised
+        # process: adoption registered it in the live registry. Only kill
+        # a process that never made it under supervision.
+        if new_pid is not None and termux_runtime.get_supervisor(
+                deployment_id) is None:
+            try:
+                termux_runtime.stop_process(new_pid)
+            except Exception:
+                pass
+        release_port_reservations(reserved_ports)
+        if resource_reserved:
             release_resource_reservation(deployment_id)
 
 

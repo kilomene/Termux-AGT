@@ -317,6 +317,11 @@ def heartbeat_loop(ctx: WorkerContext, stop_event: threading.Event) -> None:
                 outcome = self_update.check_and_apply(resp or {}, ctx, log=LOG.info)
                 if outcome == "updated":
                     LOG.info("worker updated; restart requested")
+                    if getattr(config, "termux", False):
+                        # No systemd on Termux: stop cleanly here so the
+                        # termux supervisor reboots us into the new
+                        # release (it watches the restart-requested flag).
+                        stop_event.set()
                     return  # the service manager restarts us
             except self_update.UpdateError as exc:
                 LOG.error("self-update failed (still on %s): %s",

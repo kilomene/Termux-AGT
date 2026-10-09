@@ -204,12 +204,39 @@ def _health_check_release(release_dir: Path, log=None) -> None:
         log("update self-check passed (compile + import)")
 
 
+def _restart_service(work: Path, termux: bool, log=None) -> None:
+    """Restart the worker after swinging the release symlink.
+
+    Linux: ``systemctl restart agent-host-worker`` (argv list, no shell).
+    Termux (no systemd): touch the supervisor's restart flag and return —
+    the heartbeat loop stops the worker on "updated" and the termux
+    supervisor boots the new release. Raises UpdateError when the
+    systemd restart fails (the caller rolls the symlink back).
+    """
+    if termux:
+        flag = work / "updates" / "restart-requested"
+        flag.parent.mkdir(parents=True, exist_ok=True)
+        flag.touch()
+        if log:
+            log("termux mode: restart requested via supervisor flag; the "
+                "worker will exit and the supervisor will boot the new "
+                "release")
+        return
+    proc = subprocess.run(
+        ["systemctl", "restart", SERVICE_NAME],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120,
+    )
+    if proc.returncode != 0:
+        raise UpdateError(f"systemctl restart failed: {proc.stderr[-2000:]}")
+
+
 def apply_update(update_info: dict, work_dir: str, current_version: str,
-                 download_fn=None, log=None) -> str:
+                 download_fn=None, log=None, termux: bool = False) -> str:
     """Apply one advertised update. Returns 'updated'; raises UpdateError.
 
     download_fn(url, dest_path) may be injected (tests); default streams
-    the URL with requests (outbound HTTPS).
+    the URL with requests (outbound HTTPS). termux=True selects the
+    systemd-free restart path (supervisor flag + process exit).
     """
     version = str(update_info.get("version", "")).strip()
     url = str(update_info.get("url", "")).strip()
@@ -304,19 +331,25 @@ def apply_update(update_info: dict, work_dir: str, current_version: str,
     if log:
         log(f"update {version} installed; restarting {SERVICE_NAME}")
     pre_ts = time.time()
-    proc = subprocess.run(
-        ["systemctl", "restart", SERVICE_NAME],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120,
-    )
-    if proc.returncode != 0:
+    try:
+        _restart_service(work, termux, log=log)
+    except UpdateError as exc:
         # rollback the symlink; the old code is still on disk
         _rollback_symlink(work, previous_target)
         raise UpdateError(
-            f"systemctl restart failed: {proc.stderr[-2000:]}; "
-            "symlink rolled back to previous release")
-    # Post-restart health gate: the NEW worker must write a fresh boot
-    # marker and stay active within the timeout, or we roll back. This is
-    # what catches a release that installs cleanly but crashes on boot.
+            f"{exc}; symlink rolled back to previous release") from exc
+    if termux:
+        # No systemd on Termux: the supervisor reboots the worker when this
+        # process exits (the heartbeat loop stops on "updated"). The
+        # post-restart health gate below cannot run in-process — the new
+        # release only boots after we exit — so it is skipped here; the
+        # termux supervisor applies crash backoff and the operator can
+        # roll back via the releases/ dir if the new version misbehaves.
+        return "updated"
+    # Post-restart health gate (systemd path only): the NEW worker must
+    # write a fresh boot marker and stay active within the timeout, or we
+    # roll back. This is what catches a release that installs cleanly but
+    # crashes on boot.
     if not wait_for_healthy(str(work), version, pre_ts,
                             timeout_s=HEALTH_TIMEOUT_S, log=log):
         _rollback_symlink(work, previous_target)
@@ -344,4 +377,5 @@ def check_and_apply(heartbeat_response: dict, ctx, log=None) -> str:
     if not update_info:
         return "noop"
     return apply_update(update_info, ctx.config.work_dir,
-                        ctx.config.worker_version, log=log)
+                        ctx.config.worker_version, log=log,
+                        termux=bool(getattr(ctx.config, "termux", False)))
