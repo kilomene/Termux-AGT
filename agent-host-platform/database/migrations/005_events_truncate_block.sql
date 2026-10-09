@@ -1,0 +1,37 @@
+-- 005_events_truncate_block.sql
+--
+-- Append-only hardening for the events journal against TRUNCATE.
+--
+-- Background: the row-level trigger from 001 blocks UPDATE/DELETE, but
+-- TRUNCATE bypasses row triggers entirely. PostgreSQL event triggers
+-- CANNOT close this hole: TRUNCATE fires no DDL event, and
+-- CREATE EVENT TRIGGER ... WHEN TAG IN ('TRUNCATE TABLE') is rejected by
+-- the server (verified on PostgreSQL 16:
+-- "event triggers are not supported for TRUNCATE TABLE"). An earlier
+-- revision of this migration tried exactly that and could never apply.
+--
+-- What this migration does (defense in depth):
+--   REVOKE TRUNCATE ON public.events FROM PUBLIC;
+-- This stops every non-owner role from truncating the journal.
+--
+-- Known limitation (documented, not hidden): the table OWNER can always
+-- TRUNCATE regardless of REVOKE. In the standard deployment the migration
+-- runner owns the tables, so this REVOKE alone does not stop the owner.
+-- Complete protection requires the events table to be owned by a dedicated
+-- role distinct from the application role:
+--
+--   -- as superuser (e.g. Supabase SQL editor):
+--   CREATE ROLE uagt_events_owner NOLOGIN;
+--   ALTER TABLE public.events OWNER TO uagt_events_owner;
+--   REVOKE ALL ON public.events FROM PUBLIC, <app_role>;
+--   GRANT INSERT, SELECT ON public.events TO <app_role>;
+--   GRANT USAGE, SELECT ON SEQUENCE public.events_id_seq TO <app_role>;
+--
+-- (Adjust the sequence name to the real one.) After that, the application
+-- role physically cannot TRUNCATE/UPDATE/DELETE the journal even with a
+-- compromised credential. See docs/security.md "events table ownership".
+--
+-- This migration runs fine inside a transaction and needs no superuser:
+-- REVOKE only requires being the table owner (or superuser).
+
+REVOKE TRUNCATE ON public.events FROM PUBLIC;
