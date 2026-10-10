@@ -64,6 +64,10 @@ rm -rf "$CP_API"
 cp -r "$API_SRC" "$CP_API"
 rm -rf "$CP_HOME/agent-host-platform/dashboard"
 cp -r "$DASH_SRC" "$CP_HOME/agent-host-platform/dashboard"
+# The API resolves database/migrations relative to its install root at
+# startup (see api/src/db/migrate.ts) — it must be copied too.
+rm -rf "$CP_HOME/agent-host-platform/database"
+cp -r "$REPO_DIR/agent-host-platform/database" "$CP_HOME/agent-host-platform/database"
 
 # -- 3. build -----------------------------------------------------------------
 log "npm ci (takes a few minutes on a phone)"
