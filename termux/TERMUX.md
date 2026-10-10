@@ -1,20 +1,18 @@
-# Termux-AGT — your Android phone as a deployment host
+# Termux-AGT — the whole system runs on your Android phone
 
 Termux-AGT turns an Android phone running [Termux](https://termux.dev) into a
-first-class deployment host: the phone runs the Python host worker, claims
-deploy tasks from the control plane, and runs apps as supervised native
-processes. Termux-AGT is its own complete system — **not** part of
-uaht.novamail.store:
+complete, self-contained deployment system — **Android phones only: no VM,
+no Windows, nothing else.** The phone runs everything:
 
-| Piece | Termux-AGT | Universal-AGT |
+| Piece | Where | Notes |
 |---|---|---|
-| Control plane | `https://termux.novamail.store` | `https://uaht.novamail.store` |
-| Database | own Supabase project (`termux-agt`) | own Supabase project |
-| Edge / tunnel | own Cloudflare tunnel | own Cloudflare tunnel |
-| Hosts | Android phone(s) via Termux | Linux VM(s) via Docker |
+| Control-plane API + dashboard | phone (Termux, node, `127.0.0.1:3100`) | `termux/setup-control-plane.sh` |
+| Database | Supabase (`termux-agt` project) | phone dials out to it |
+| Public URL | `https://termux.novamail.store` | via cloudflared **on the phone** |
+| Host worker | phone (Termux, Python) | talks to the API over localhost |
+| Apps | phone, supervised native processes | no Docker on Android |
 
-The phone is just a host — it dials out to `https://termux.novamail.store`,
-claims tasks, and serves its apps from the phone's own IP address.
+It is its own system — **not** part of uaht.novamail.store.
 
 There is no Docker on Android, so the phone runs the **`termux` execution
 backend**: apps are supervised OS processes, not containers. Everything else
@@ -24,79 +22,68 @@ rollback, crash-loop detection, self-updates — is the same worker.
 ## How it fits together
 
 ```
-agent ──deploy (runtime=termux)──▶ control plane ──task──▶ phone worker (Termux)
-                                                            │  shlex-split service.command
-                                                            │  supervised process, $PORT injected
-                                                            ▼
-                                              app answers 127.0.0.1:<port>/ with 200
-                                                            │
-user/agent ────────────────────────── http://<phone-ip>:<port>/ ◀──┘
+agent ──deploy (runtime=termux)──▶ https://termux.novamail.store
+                                          │  (API on the phone, via tunnel)
+                                          ▼
+                                   phone worker (Termux)
+                                          │  shlex-split service.command
+                                          │  supervised process, $PORT injected
+                                          ▼
+                            app answers 127.0.0.1:<port>/ with 200
+                                          │
+user/agent ──────── http://<phone-ip>:<port>/ ◀──┘
 ```
 
-The worker is **outbound-only**: it dials out to the control plane over HTTPS
-and never listens inbound. Deployed apps listen on `127.0.0.1` ports *on the
-phone*; you reach them at the phone's IP (Tailscale IP is the easy stable
-choice; the Wi-Fi/LAN IP works too).
+The phone dials **out** for everything it needs: the API reaches Supabase,
+cloudflared reaches the Cloudflare edge, the worker reaches the API on
+localhost. Deployed apps listen on `127.0.0.1` ports *on the phone*; you
+reach them at the phone's IP (Tailscale IP is the easy stable choice; the
+Wi-Fi/LAN IP works too).
 
 ## Phone prerequisites
 
 1. **Termux from F-Droid** (or the GitHub releases) — NOT the Play Store
    build, which is years out of date and broken.
 2. **Termux:API** (F-Droid) — needed for the wake lock that keeps the CPU on.
-3. **Termux:Boot** (F-Droid, optional but recommended) — starts the worker
+3. **Termux:Boot** (F-Droid, optional but recommended) — starts everything
    when the phone reboots.
 4. Android 7+ (arm64 recommended). The phone should stay on Wi-Fi and ideally
    on a charger — it is now a server.
 
-## Control plane install (on the VM, one time)
-
-Termux-AGT's control plane is its own production system — separate Supabase
-database, separate Cloudflare tunnel, separate domain. On the Debian/Ubuntu
-host (the Grok VM), as the `box` user:
-
-```bash
-git clone https://github.com/kilomene/Termux-AGT
-cd Termux-AGT
-bash install-termux-cp.sh
-```
-
-Before running it, two secret files must exist (the script fails loudly with
-the exact source if they're missing — it never prompts):
-
-- `/etc/termux-agt/tunnel.token` — Cloudflare dashboard → Zero Trust →
-  Tunnels → `termux-agt` (its own tunnel; DNS `termux.novamail.store`
-  CNAMEs to it, proxied)
-- `/etc/termux-agt/control-plane.env` — with `DATABASE_URL` (the
-  `termux-agt` Supabase project, **direct** connection port 5432),
-  `DATA_ENCRYPTION_KEY` and `UAHT_PROVISIONING_TOKEN` (fresh
-  `openssl rand -hex 32` values)
-
-The installer puts the API on internal port **3100** (uaht keeps 3000, so both
-systems can share the host), supervises it plus dual cloudflared plus a
-5-second watchdog, and installs a cron `@reboot` hook. Verify from anywhere:
-`curl https://termux.novamail.store/v1/health`.
-
 ## Install (on the phone, inside Termux)
+
+**Step 1 — the control plane.** You need two things from your dashboards
+first: the `termux-agt` Supabase project's **direct** connection string
+(port 5432), and your `termux-agt` Cloudflare **tunnel token** (Zero Trust →
+Tunnels → `termux-agt`; its public hostname `termux.novamail.store` must
+route to `http://127.0.0.1:3100`).
 
 ```bash
 pkg install -y git
 git clone https://github.com/kilomene/Termux-AGT
 cd Termux-AGT
-bash termux/setup-termux.sh
+bash termux/setup-control-plane.sh
 ```
+
+It asks for the database URL, the tunnel token, and offers to generate the
+encryption key and provisioning token (it shows the provisioning token once
+— save it, the worker installer needs it next). It builds the API, stores
+everything under `~/agent-host` (mode 600), installs cloudflared, and
+smoke-tests the API against your real database.
+
+**Step 2 — the worker.**
 
 The installer asks for three things:
 
 | Prompt | What it is |
 |---|---|
-| Control plane URL | `https://termux.novamail.store` (default) |
+| Control plane URL | `http://127.0.0.1:3100` (default when the phone API is installed) |
 | Host name | e.g. `termux-phone` (default) |
-| Provisioning token | the Termux-AGT control-plane provisioning token (from `/etc/termux-agt/control-plane.env` on the VM — never the uaht one) |
+| Provisioning token | the token shown by `setup-control-plane.sh` (from `~/agent-host/config/control-plane.env`) |
 
-It registers the phone as `host_type=termux-android-host` with
-`capabilities=["termux"]`, writes `~/agent-host/config/worker.env`
-(mode 600), installs the boot entry and the supervisor, takes a wake lock,
-and offers to start the worker immediately.
+It writes `~/agent-host/config/worker.env` (mode 600), installs the boot
+entry and the supervisor, takes a wake lock, and offers to start everything
+immediately.
 
 Two manual Android steps the installer cannot do for you:
 

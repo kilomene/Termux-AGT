@@ -1,8 +1,10 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Termux-AGT phone installer — turns this Android phone into a
-# Universal-AGT host.
+# complete Termux-AGT system: control plane + host worker, all on the phone.
 #
-# Run INSIDE Termux, from the Termux-AGT repo root:
+# Run INSIDE Termux, from the Termux-AGT repo root. Run the control-plane
+# installer FIRST (it needs your Supabase database + Cloudflare tunnel):
+#     bash termux/setup-control-plane.sh
 #     bash termux/setup-termux.sh
 #
 # What it does:
@@ -11,14 +13,17 @@
 #   3. copies the Python host worker into ~/agent-host/worker
 #   4. registers this phone with the control plane (provisioning token)
 #      as host_type=termux-android-host, capabilities=[termux]
+#      (defaults to the phone's own API at http://127.0.0.1:3100 when the
+#      control plane is installed on this phone)
 #   5. writes ~/agent-host/config/worker.env (mode 600)
 #   6. installs the boot entry (~/.termux/boot, needs the Termux:Boot app)
-#      and the supervisor that keeps the worker alive
-#   7. acquires a wake lock and offers to start the worker now
+#      and the supervisor that keeps the API, the tunnel and the worker alive
+#   7. acquires a wake lock and offers to start everything now
 #
-# The worker is OUTBOUND-ONLY: it dials out to the control plane over
-# HTTPS and never listens inbound. Deployed apps listen on 127.0.0.1
-# ports on the phone; reach them via the phone's IP (Tailscale or LAN).
+# The phone is the whole system: the API serves https://termux.novamail.store
+# via the Cloudflare tunnel running on the phone, the worker dials the API
+# over localhost, and deployed apps listen on 127.0.0.1 ports on the phone.
+# Android phones only — no VM, no Windows, nothing else.
 set -euo pipefail
 
 log()  { echo "[termux-agt] $*"; }
@@ -92,8 +97,14 @@ if [ -s "$ENV_FILE" ] && grep -qE "^WORKER_HOST_TOKEN=[^[:space:]]" "$ENV_FILE";
   log "worker.env already has credentials; skipping registration"
 else
   log "registering this phone with the control plane"
-  read -r -p "Control plane URL [https://termux.novamail.store]: " CP_URL
-  CP_URL="${CP_URL:-https://termux.novamail.store}"
+  if [ -f "$AGENT_HOME/control-plane/agent-host-platform/control-plane/api/dist/index.js" ]; then
+    CP_DEFAULT="http://127.0.0.1:3100"
+    log "phone control plane detected — defaulting to the local API"
+  else
+    CP_DEFAULT="https://termux.novamail.store"
+  fi
+  read -r -p "Control plane URL [$CP_DEFAULT]: " CP_URL
+  CP_URL="${CP_URL:-$CP_DEFAULT}"
   read -r -p "Host name [termux-phone]: " HOST_NAME
   HOST_NAME="${HOST_NAME:-termux-phone}"
   read -r -s -p "Provisioning token: " PROV_TOKEN; echo
