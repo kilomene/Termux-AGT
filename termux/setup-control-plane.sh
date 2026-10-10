@@ -113,14 +113,17 @@ EOF
 fi
 
 # -- 5. cloudflared ---------------------------------------------------------------
-if [ ! -x "$CLOUDFLARED_BIN" ]; then
-  log "installing cloudflared (arm64)"
-  # Pinned — "latest" has broken us before. Bump deliberately.
-  CLOUDFLARED_VERSION="2026.10.0"
-  curl -fsSL -o "$CLOUDFLARED_BIN" \
-    "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-arm64" \
-    || fail "cloudflared download failed"
-  chmod +x "$CLOUDFLARED_BIN"
+# MUST be the Termux package (Android-native build). The precompiled
+# linux-arm64 binary from GitHub cannot resolve DNS on Android — every lookup
+# fails with "server misbehaving" on [::1]:53 (verified on-device 2026-10-10).
+if command -v cloudflared >/dev/null 2>&1; then
+  CLOUDFLARED_BIN="$(command -v cloudflared)"
+  log "cloudflared already installed: $CLOUDFLARED_BIN"
+else
+  log "installing cloudflared via Termux package"
+  pkg install -y cloudflared || fail "pkg install cloudflared failed"
+  CLOUDFLARED_BIN="$(command -v cloudflared)" \
+    || fail "cloudflared not found after install"
 fi
 "$CLOUDFLARED_BIN" --version >/dev/null 2>&1 \
   || fail "cloudflared does not run on this phone (see output above)"

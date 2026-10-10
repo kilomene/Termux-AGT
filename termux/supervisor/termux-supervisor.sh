@@ -85,10 +85,19 @@ else
 fi
 
 # --- 2. cloudflared tunnel ----------------------------------------------------
-if [ -x "$CLOUDFLARED_BIN" ] && [ -s "$TOKEN_FILE" ]; then
+# Prefer the Termux-packaged cloudflared (Android-native build with working
+# DNS). The precompiled linux-arm64 binary cannot resolve DNS on Android
+# ("server misbehaving" on [::1]:53) — verified on-device 2026-10-10.
+CFD_BIN=""
+if command -v cloudflared >/dev/null 2>&1; then
+  CFD_BIN="$(command -v cloudflared)"
+elif [ -x "$CLOUDFLARED_BIN" ]; then
+  CFD_BIN="$CLOUDFLARED_BIN"
+fi
+if [ -n "$CFD_BIN" ] && [ -s "$TOKEN_FILE" ]; then
   supervise "cloudflared" \
-    'exec "$HOME/agent-host/bin/cloudflared" tunnel --no-autoupdate run --token "$(cat "$HOME/agent-host/config/tunnel.token")"' &
-  log "cloudflared: enabled"
+    "exec \"$CFD_BIN\" tunnel --no-autoupdate run --token \"\$(cat \"$TOKEN_FILE\")\"" &
+  log "cloudflared: enabled ($CFD_BIN)"
 else
   log "cloudflared: not installed; skipping (https://termux.novamail.store will not work)"
 fi
