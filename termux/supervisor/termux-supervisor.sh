@@ -31,26 +31,26 @@ log() { echo "$(date '+%F %T') supervisor: $*" >>"$LOG"; }
 [ -f "$ENV_FILE" ] || { log "FATAL: $ENV_FILE missing — run termux/setup-termux.sh"; exit 1; }
 [ -d "$WORKER_DIR" ] || { log "FATAL: $WORKER_DIR missing — run termux/setup-termux.sh"; exit 1; }
 
-# One supervisor at a time: if another copy is running, exit quietly.
-# pgrep -f also matches our own ancestors (the ssh/nohup parents whose command
-# lines contain the script name) — exclude self and the whole ancestor chain.
-if command -v pgrep >/dev/null 2>&1; then
-  ancestors=" $$ "
-  _p="$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ' || true)"
-  while [ -n "$_p" ] && [ "$_p" != "0" ] && [ "$_p" != "1" ]; do
-    ancestors="$ancestors$_p "
-    _p="$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ' || true)"
-  done
-  others=""
-  for _pid in $(pgrep -f 'termux-supervisor\.sh' 2>/dev/null || true); do
-    case "$ancestors" in *" $_pid "*) continue ;; esac
-    others="$others$_pid "
-  done
-  if [ -n "$others" ]; then
-    log "another supervisor is already running (pid(s):$others); exiting"
-    exit 0
+# One supervisor at a time, via a PID lock file. (pgrep -f is unreliable here:
+# the ssh/nohup parents' command lines also contain the script name, and they
+# can exit mid-check, defeating ancestor exclusion.)
+SUP_PIDFILE="$AGENT_HOME/supervisor.pid"
+if [ -f "$SUP_PIDFILE" ]; then
+  _oldpid="$(cat "$SUP_PIDFILE" 2>/dev/null | tr -cd '0-9' || true)"
+  if [ -n "$_oldpid" ] && kill -0 "$_oldpid" 2>/dev/null; then
+    _cmd="$(tr '\0' ' ' </proc/$_oldpid/cmdline 2>/dev/null || true)"
+    case "$_cmd" in
+      *termux-supervisor.sh*)
+        log "another supervisor is already running (pid $_oldpid); exiting"
+        exit 0
+        ;;
+    esac
   fi
+  # stale lock (dead pid or recycled pid) - take it over
+  log "taking over stale supervisor lock (was pid ${_oldpid:-none})"
 fi
+echo "$$" > "$SUP_PIDFILE"
+trap 'rm -f "$SUP_PIDFILE"' EXIT
 
 if command -v termux-wake-lock >/dev/null 2>&1; then
   termux-wake-lock 2>/dev/null || log "warning: termux-wake-lock failed"
