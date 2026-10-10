@@ -1,4 +1,9 @@
 import 'dotenv/config';
+import { setServers } from 'dns';
+// Termux-AGT (2026-10-10): Android carrier DNS can fail (e.g. during
+// WiFi->mobile data switches), which takes the Supabase pooler hostname
+// down with it. Pin public DNS so Node never depends on the carrier's.
+setServers(['8.8.8.8', '1.1.1.1', '8.8.4.4']);
 import { randomUUID } from 'crypto';
 import { existsSync } from 'fs';
 import { join, resolve } from 'path';
@@ -19,6 +24,7 @@ import { domainsRouter } from './routes/domains';
 import { eventsRouter } from './routes/events';
 import { healthRouter } from './routes/health';
 import { hostsRouter } from './routes/hosts';
+import { phoneRouter } from './routes/phone';
 import { projectsRouter } from './routes/projects';
 import { servicesRouter } from './routes/services';
 import { tasksRouter } from './routes/tasks';
@@ -100,6 +106,7 @@ export function createApp(): express.Express {
   v1.use('/hosts', hostsRouter);
   v1.use('/hosts', workerRouter); // heartbeat lives here: POST /hosts/:id/heartbeat
   v1.use('/worker', workerRouter); // claim + progress: /worker/tasks/...
+  v1.use('/phone', phoneRouter); // host phone health: GET /phone/stats
   v1.use('/projects', projectsRouter);
   v1.use('/artifacts', artifactsRouter);
   v1.use('/deployments', deploymentsRouter);
@@ -146,7 +153,24 @@ async function main(): Promise<void> {
     process.exit(1);
   }
   const pool = getPool();
-  const applied = await runMigrations(pool);
+  // Termux-AGT (2026-10-10): on the phone the network can be briefly
+  // unreachable at boot (tunnel/DNS race). Retry migrations for ~2 minutes
+  // instead of crashing — the supervisor backs off 5 minutes on a crash,
+  // which turns a 10s blip into real downtime.
+  let applied: string[] = [];
+  for (let attempt = 1; ; attempt++) {
+    try {
+      applied = await runMigrations(pool);
+      break;
+    } catch (err) {
+      if (attempt >= 12) throw err;
+      logger.warn('db migration failed; retrying', {
+        attempt,
+        err: String(err),
+      });
+      await new Promise((r) => setTimeout(r, 10_000));
+    }
+  }
   if (applied.length) logger.info('migrations applied at startup', { applied });
   await startEventBus(pool);
   const stopHostSweeper = startHostSweeper(pool);
