@@ -34,9 +34,14 @@ def _read_cpu_times() -> tuple[int, int]:
 
 
 def cpu_percent(sample_secs: float = 0.2) -> float:
-    idle0, total0 = _read_cpu_times()
-    time.sleep(sample_secs)
-    idle1, total1 = _read_cpu_times()
+    # /proc/stat is unreadable on some Android phones (PermissionError) —
+    # report 0.0 instead of crashing the worker.
+    try:
+        idle0, total0 = _read_cpu_times()
+        time.sleep(sample_secs)
+        idle1, total1 = _read_cpu_times()
+    except OSError:
+        return 0.0
     idle_d, total_d = idle1 - idle0, total1 - total0
     if total_d <= 0:
         return 0.0
@@ -45,14 +50,17 @@ def cpu_percent(sample_secs: float = 0.2) -> float:
 
 def memory_percent() -> float:
     total = avail = None
-    with open("/proc/meminfo", "r", encoding="utf-8") as fh:
-        for line in fh:
-            if line.startswith("MemTotal:"):
-                total = int(line.split()[1])
-            elif line.startswith("MemAvailable:"):
-                avail = int(line.split()[1])
-            if total is not None and avail is not None:
-                break
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    total = int(line.split()[1])
+                elif line.startswith("MemAvailable:"):
+                    avail = int(line.split()[1])
+                if total is not None and avail is not None:
+                    break
+    except OSError:
+        return 0.0
     if not total:
         return 0.0
     return round(max(0.0, min(100.0, (1.0 - avail / total) * 100.0)), 1)
@@ -68,10 +76,13 @@ def disk_percent(path: str = "/") -> float:
 
 
 def total_ram_mb() -> float:
-    with open("/proc/meminfo", "r", encoding="utf-8") as fh:
-        for line in fh:
-            if line.startswith("MemTotal:"):
-                return round(int(line.split()[1]) / 1024.0, 1)
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    return round(int(line.split()[1]) / 1024.0, 1)
+    except OSError:
+        pass
     return 0.0
 
 
