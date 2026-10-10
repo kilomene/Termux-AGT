@@ -32,10 +32,22 @@ log() { echo "$(date '+%F %T') supervisor: $*" >>"$LOG"; }
 [ -d "$WORKER_DIR" ] || { log "FATAL: $WORKER_DIR missing — run termux/setup-termux.sh"; exit 1; }
 
 # One supervisor at a time: if another copy is running, exit quietly.
+# pgrep -f also matches our own ancestors (the ssh/nohup parents whose command
+# lines contain the script name) — exclude self and the whole ancestor chain.
 if command -v pgrep >/dev/null 2>&1; then
-  others="$(pgrep -f 'termux-supervisor.sh' | grep -v "^$$$" || true)"
+  ancestors=" $$ "
+  _p="$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ' || true)"
+  while [ -n "$_p" ] && [ "$_p" != "0" ] && [ "$_p" != "1" ]; do
+    ancestors="$ancestors$_p "
+    _p="$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ' || true)"
+  done
+  others=""
+  for _pid in $(pgrep -f 'termux-supervisor\.sh' 2>/dev/null || true); do
+    case "$ancestors" in *" $_pid "*) continue ;; esac
+    others="$others$_pid "
+  done
   if [ -n "$others" ]; then
-    log "another supervisor is already running (pid(s): $others); exiting"
+    log "another supervisor is already running (pid(s):$others); exiting"
     exit 0
   fi
 fi
