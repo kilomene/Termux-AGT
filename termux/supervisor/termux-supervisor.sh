@@ -139,6 +139,7 @@ worker_loop() {
     fi
     log "worker: starting"
     WORKER_CONFIG="$ENV_FILE" \
+      PYTHONPATH="$WORKER_DIR" \
       python3 "$WORKER_DIR/agent/main.py" --config "$ENV_FILE" >>"$LOG" 2>&1
     local rc=$?
     log "worker: exited rc=$rc; restarting in 5s"
