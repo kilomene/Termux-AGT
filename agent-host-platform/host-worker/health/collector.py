@@ -22,6 +22,27 @@ from deployments.manifest import normalize_resources
 RESERVING_STATUSES = ("running", "starting", "healthcheck")
 
 
+def default_disk_path() -> str:
+    """Filesystem path whose stats represent the device's real storage.
+
+    On Termux (Android), '/' is a tiny system mount (~1GB, always near-full)
+    — the real userdata partition is visible under the Termux home
+    (/data/data/com.termux/files/home). Measuring '/' there reports a
+    permanent ~100% full on a 1.3GB phantom disk. Everywhere else '/' is
+    the correct device storage.
+
+    Detection is filesystem-based (not $PREFIX) so it holds no matter how
+    the worker process was launched.
+    """
+    termux_home = "/data/data/com.termux/files/home"
+    if os.path.isdir(termux_home):
+        home = os.environ.get("HOME", "")
+        if home and os.path.isdir(home):
+            return home
+        return termux_home
+    return "/"
+
+
 def _read_cpu_times() -> tuple[int, int]:
     """Return (idle, total) jiffies from the aggregate cpu line of /proc/stat."""
     with open("/proc/stat", "r", encoding="utf-8") as fh:
@@ -133,12 +154,17 @@ def allocated_resources(deployment_store=None) -> dict:
 
 
 def collect_metrics(docker_client=None, deployment_store=None,
-                    config=None, disk_path: str = "/") -> dict:
+                    config=None, disk_path: str | None = None) -> dict:
     """Build the heartbeat payload body (PROTOCOL §3.3).
 
     docker_status: "ok" | "missing" | "error: ..."
     running_apps: [{deployment_id, project, status}]
+
+    disk_path defaults to default_disk_path(): on Termux that is the real
+    userdata partition, not '/' (a ~1GB always-full system mount).
     """
+    if disk_path is None:
+        disk_path = default_disk_path()
     if docker_client is not None:
         try:
             # Short timeout: a wedged docker daemon must never stall heartbeats.

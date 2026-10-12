@@ -474,3 +474,51 @@ def test_normalize_resources_single_parsing_rule():
     assert normalize_resources({"cpu": "x", "memory": "512MB"}) == {
         "cpu": None, "ram_mb": None}
     assert normalize_resources(None) == {"cpu": None, "ram_mb": None}
+
+
+# ---------------------------------------------------------------------------
+# Termux disk honesty: '/' on Android is a tiny always-full system mount;
+# the real userdata partition is visible under the Termux home.
+# Detection is filesystem-based so it holds however the worker was launched.
+# ---------------------------------------------------------------------------
+def _fake_isdir(monkeypatch, real_isdir, termux_present):
+    def fake(path):
+        if path == "/data/data/com.termux/files/home":
+            return termux_present
+        return real_isdir(path)
+
+    monkeypatch.setattr(collector.os.path, "isdir", fake)
+
+
+def test_default_disk_path_termux_uses_home(monkeypatch, tmp_path):
+    _fake_isdir(monkeypatch, collector.os.path.isdir, True)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert collector.default_disk_path() == str(tmp_path)
+
+
+def test_default_disk_path_non_termux_is_root(monkeypatch):
+    _fake_isdir(monkeypatch, collector.os.path.isdir, False)
+    monkeypatch.delenv("PREFIX", raising=False)
+    assert collector.default_disk_path() == "/"
+
+
+def test_default_disk_path_termux_home_missing_falls_back(monkeypatch, tmp_path):
+    _fake_isdir(monkeypatch, collector.os.path.isdir, True)
+    monkeypatch.setenv("HOME", "/nonexistent-termux-home-xyz")
+    assert collector.default_disk_path() == "/data/data/com.termux/files/home"
+
+
+def test_collect_metrics_measures_termux_userdata(monkeypatch, tmp_path):
+    _fake_isdir(monkeypatch, collector.os.path.isdir, True)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    seen = {}
+    orig = collector.disk_percent
+
+    def spy(path="/"):
+        seen["path"] = path
+        return orig(path)
+
+    monkeypatch.setattr(collector, "disk_percent", spy)
+    metrics = collector.collect_metrics()
+    assert seen["path"] == str(tmp_path)
+    assert metrics["disk_pct"] == orig(str(tmp_path))
